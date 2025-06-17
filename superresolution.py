@@ -1,3 +1,14 @@
+"""
+superresolution.py
+Main script for deep learning-based image super-resolution using LAB color space.
+"""
+
+# --- Standard Library Imports ---
+import warnings
+from pathlib import Path
+from io import BytesIO
+
+# --- Third-Party Imports ---
 import hydra
 import torch
 import torch.nn as nn
@@ -10,16 +21,20 @@ from skimage import color
 from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
-from pathlib import Path
 from huggingface_hub import login as hf_login
-from io import BytesIO
 import lpips
 from torchinfo import summary
-import warnings
 
 
 # --- Utility: LAB Color Conversion ---
-def to_lab_tensor(img):
+def to_lab_tensor(img: Image.Image) -> torch.Tensor:
+    """
+    Convert a PIL RGB image to a normalized LAB torch tensor.
+    Args:
+        img: PIL Image in RGB mode.
+    Returns:
+        torch.Tensor: LAB image, shape (3, H, W), normalized.
+    """
     arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
     lab = color.rgb2lab(arr)
     l_channel = lab[..., 0:1] / 100.0
@@ -29,7 +44,14 @@ def to_lab_tensor(img):
     return torch.from_numpy(lab_norm.transpose(2, 0, 1).copy()).float()
 
 
-def to_numpy_img(lab_tensor):
+def to_numpy_img(lab_tensor: torch.Tensor) -> np.ndarray:
+    """
+    Convert a normalized LAB torch tensor to a numpy RGB image.
+    Args:
+        lab_tensor: torch.Tensor, shape (3, H, W), normalized.
+    Returns:
+        np.ndarray: RGB image, shape (H, W, 3), values in [0, 1].
+    """
     arr = lab_tensor.detach().cpu().numpy().transpose(1, 2, 0)
     l_channel = arr[..., 0] * 100.0
     a = arr[..., 1] * 128.0
@@ -42,7 +64,16 @@ def to_numpy_img(lab_tensor):
 
 
 # --- Dataset Stream ---
-def preprocess_stream(dataset, crop_size, scale):
+def preprocess_stream(dataset, crop_size: int, scale: int):
+    """
+    Stream and preprocess images from a dataset, yielding (lowres, highres) LAB tensors.
+    Args:
+        dataset: Streaming dataset iterator.
+        crop_size: Size of high-res crop.
+        scale: Downscaling factor.
+    Yields:
+        Tuple[torch.Tensor, torch.Tensor]: (lowres, highres) LAB tensors.
+    """
     lowres_size = crop_size // scale
     crop = transforms.RandomCrop(crop_size)
     for example in dataset:
@@ -74,7 +105,11 @@ def preprocess_stream(dataset, crop_size, scale):
 
 
 class SuperResStream(IterableDataset):
-    def __init__(self, dataset, crop_size, scale):
+    """
+    IterableDataset for streaming super-resolution image pairs.
+    """
+
+    def __init__(self, dataset, crop_size: int, scale: int):
         self.dataset = dataset
         self.crop_size = crop_size
         self.scale = scale
@@ -85,63 +120,75 @@ class SuperResStream(IterableDataset):
 
 # --- Model ---
 class DeepSuperResNet(nn.Module):
+    """
+    Deep CNN for super-resolving the L channel in LAB color space.
+    Modified: After the head, add a conv to 128 channels. Body uses 128 channels, fewer layers. Upsample and tail adjusted accordingly.
+    """
+
     def __init__(self):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=7, padding=3),
+            nn.Conv2d(3, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),  # New conv to 128 channels
             nn.ReLU(inplace=True),
         )
-        # Make the body deeper and wider
         body_layers = []
-        for _ in range(8):
-            body_layers.append(nn.Conv2d(64, 64, kernel_size=3, padding=1))
+        for _ in range(8):  # Fewer layers, all 128 channels
+            body_layers.append(nn.Conv2d(128, 128, kernel_size=3, padding=1))
             body_layers.append(nn.ReLU(inplace=True))
         self.body = nn.Sequential(*body_layers)
-        # Upsample: one PixelShuffle(2) block for 2x (32->64)
         self.upsample = nn.Sequential(
-            nn.Conv2d(64, 256, kernel_size=3, padding=1),
-            nn.PixelShuffle(2),
+            nn.Conv2d(128, 512, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),  # 128 -> 512, PixelShuffle(2) -> 128
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 512, kernel_size=3, padding=1),  # 128 -> 512
+            nn.PixelShuffle(2),  # 512 -> 128
             nn.ReLU(inplace=True),
         )
-        self.tail = nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        self.tail = nn.Conv2d(
+            128,
+            1,
+            kernel_size=3,
+            padding=1,
+        )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.head(x)
         x = self.body(x)
         x = self.upsample(x)
         x = self.tail(x)
-        if x.shape[1] > 1:
-            x = x[:, 0:1]
         return x
 
 
 # --- Visualization ---
 def visualize_progress(
-    model,
-    lowres,
-    highres,
-    num_samples,
-    device,
-    loss=None,
-    epoch=None,
-    val_lowres=None,
-    val_highres=None,
+    model: nn.Module,
+    lowres: torch.Tensor,
+    highres: torch.Tensor,
+    num_samples: int,
+    device: torch.device,
+    loss: float | None = None,
+    epoch: int | None = None,
+    val_lowres: torch.Tensor = None,
+    val_highres: torch.Tensor = None,
 ):
+    """
+    Visualize and save progress images for training and validation batches.
+    """
     model.eval()
     with torch.no_grad():
-        # Split L and AB
-        lowres_L = lowres[:, 0:1]
+        # Split AB (L is not used)
         lowres_AB = lowres[:, 1:3]
         highres_L = highres[:, 0:1]
-        # Predict highres L
-        # Upsample lowres_L to highres size before passing to model (to match training)
-        upsampled_L = torch.nn.functional.interpolate(
-            lowres_L,
-            size=highres_L.shape[-2:],
+        # Upsample lowres to highres size before passing to model
+        upsampled = torch.nn.functional.interpolate(
+            lowres,
+            size=highres.shape[-2:],
             mode="bicubic",
             align_corners=False,
         )
-        pred_L = model(upsampled_L.to(device)).cpu()
+        pred_L = model(upsampled.to(device)).cpu()
         # Upscale AB to highres size
         up_AB = torch.nn.functional.interpolate(
             lowres_AB,
@@ -149,7 +196,7 @@ def visualize_progress(
             mode="bilinear",
             align_corners=False,
         )
-        # --- Fix: Ensure pred_L and up_AB have the same spatial size before concatenation ---
+        # Ensure pred_L and up_AB have the same spatial size before concatenation
         if pred_L.shape[-2:] != up_AB.shape[-2:]:
             pred_L = torch.nn.functional.interpolate(
                 pred_L,
@@ -162,24 +209,21 @@ def visualize_progress(
         # For validation
         val_outputs = None
         if val_lowres is not None and val_highres is not None:
-            val_lowres_L = val_lowres[:, 0:1]
             val_lowres_AB = val_lowres[:, 1:3]
             val_highres_L = val_highres[:, 0:1]
-            # Upsample val_lowres_L to val_highres_L size before passing to model
-            val_upsampled_L = torch.nn.functional.interpolate(
-                val_lowres_L,
-                size=val_highres_L.shape[-2:],
+            val_upsampled = torch.nn.functional.interpolate(
+                val_lowres,
+                size=val_highres.shape[-2:],
                 mode="bicubic",
                 align_corners=False,
             )
-            val_pred_L = model(val_upsampled_L.to(device)).cpu()
+            val_pred_L = model(val_upsampled.to(device)).cpu()
             val_up_AB = torch.nn.functional.interpolate(
                 val_lowres_AB,
                 size=val_highres_L.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
-            # --- Fix: Ensure val_pred_L and val_up_AB have the same spatial size before concatenation ---
             if val_pred_L.shape[-2:] != val_up_AB.shape[-2:]:
                 val_pred_L = torch.nn.functional.interpolate(
                     val_pred_L,
@@ -196,7 +240,6 @@ def visualize_progress(
         )
         ncols = n + n_val
         fig, axes = plt.subplots(3, ncols, figsize=(2.5 * ncols, 8))
-        # --- Fix: Ensure axes is always 2D ---
         if ncols == 1:
             axes = axes[:, np.newaxis]
         for i in range(n):
@@ -242,25 +285,32 @@ def visualize_progress(
 
 # --- Training Loop ---
 def main_train(cfg: DictConfig):
+    """
+    Main training loop for super-resolution model.
+    """
     if cfg.access_token:
         print("Logging in to Hugging Face Hub...")
         hf_login(token=cfg.access_token)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    crop_size = 64  # 64x64 high-res patch
-    scale = 2  # 32x32 low-res patch
+    crop_size = 128  # 128x128 high-res patch
+    scale = 2  # 64x64 low-res patch
     # Dataset
-    train_dataset = load_dataset(
-        "imagenet-1k",
-        split="train",
-        streaming=True,
-        trust_remote_code=True,
-    )
-    val_dataset = load_dataset(
-        "imagenet-1k",
-        split="validation",
-        streaming=True,
-        trust_remote_code=True,
-    )
+    try:
+        train_dataset = load_dataset(
+            "imagenet-1k",
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+        )
+        val_dataset = load_dataset(
+            "imagenet-1k",
+            split="validation",
+            streaming=True,
+            trust_remote_code=True,
+        )
+    except Exception as e:
+        print(f"[Error] Failed to load dataset: {e}")
+        return
     train_stream = SuperResStream(train_dataset, crop_size, scale)
     val_stream = SuperResStream(val_dataset, crop_size, scale)
     train_loader = DataLoader(
@@ -283,7 +333,7 @@ def main_train(cfg: DictConfig):
     print(
         summary(
             model,
-            input_size=(cfg.batch_size, 1, 32, 32),
+            input_size=(cfg.batch_size, 3, 64, 64),  # 3 input channels, 64x64 low-res
             col_names=("input_size", "output_size", "num_params"),
             depth=4,
             row_settings=("var_names",),
@@ -358,10 +408,18 @@ def main_train(cfg: DictConfig):
                     print(f"Reached max_samples={cfg.max_samples}. Stopping training.")
                     return
                 # --- Only use L channel for SR, AB for upscaling ---
-                # Pass lowres L directly to model (no upsampling)
-                lowres_L = lowres[:, 0:1].to(device)
-                highres_L = highres[:, 0:1].to(device)
-                output_L = model(lowres_L)
+                lowres = lowres.to(device)
+                highres = highres.to(device)
+                # Upsample lowres to highres size before passing to model
+                upsampled = torch.nn.functional.interpolate(
+                    lowres,
+                    size=highres.shape[-2:],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                # Model predicts only L channel
+                output_L = model(upsampled)
+                highres_L = highres[:, 0:1]
                 # Fix: Ensure output_L and highres_L have the same spatial size
                 if output_L.shape[-2:] != highres_L.shape[-2:]:
                     output_L = torch.nn.functional.interpolate(
@@ -373,6 +431,7 @@ def main_train(cfg: DictConfig):
                 loss = criterion(output_L, highres_L)
                 loss.backward()
                 optimizer.step()
+                optimizer.zero_grad()
                 running_loss += loss.item()
                 num_samples += cfg.batch_size
                 batch_count += 1
@@ -405,9 +464,16 @@ def main_train(cfg: DictConfig):
                         except StopIteration:
                             val_iterator = iter(val_loader)
                             val_lowres, val_highres = next(val_iterator)
-                        val_lowres_L = val_lowres[:, 0:1].to(device)
-                        val_highres_L = val_highres[:, 0:1].to(device)
-                        val_output_L = model(val_lowres_L)
+                        val_lowres = val_lowres.to(device)
+                        val_highres = val_highres.to(device)
+                        val_upsampled = torch.nn.functional.interpolate(
+                            val_lowres,
+                            size=val_highres.shape[-2:],
+                            mode="bicubic",
+                            align_corners=False,
+                        )
+                        val_output_L = model(val_upsampled)
+                        val_highres_L = val_highres[:, 0:1]
                         if val_output_L.shape[-2:] != val_highres_L.shape[-2:]:
                             val_output_L = torch.nn.functional.interpolate(
                                 val_output_L,
@@ -431,7 +497,7 @@ def main_train(cfg: DictConfig):
             )
             val_losses.append(val_avg_loss)
             print(
-                f"Epoch: {epoch}, Train Loss: {avg_loss:.4f}, Val Loss: {val_avg_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}",
+                f"Epoch: {epoch}, Train Loss: {avg_loss:.4f}, Val Loss: {val_avg_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}\n",
             )
             scheduler.step(val_avg_loss)
             # Visualization logic
@@ -513,6 +579,7 @@ def main_train(cfg: DictConfig):
 
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(cfg: DictConfig):
+    """Hydra entry point."""
     main_train(cfg)
 
 

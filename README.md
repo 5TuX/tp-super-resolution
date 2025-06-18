@@ -33,8 +33,22 @@
         -> NVIDIA GeForce RTX 4090
     ```
 
-# Run the notebook
+# Run the notebooks
+
+1. Convolution
 
 ```
-uv run jupyter-lab tp_super_resolution.ipynb
+uv run jupyter-lab 1_convolution.ipynb
+```
+
+2. Gradient descent
+
+```
+uv run jupyter-lab 2_gradient_descent.ipynb
+```
+
+3. Super resolution
+
+```
+uv run jupyter-lab 3_super_resolution.ipynb
 ```
